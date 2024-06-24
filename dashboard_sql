@@ -33,37 +33,37 @@ jtr_log AS (
     uid,
     visit_id,
     search_request_id,
-    mergd_keyword,
+    merged_keyword,
     merged_location,
+    query_keyword,
+    query_location,
     create_datetime_jst,
     search_page,
     total_hits
   FROM
     "dataplatform_datalake"."jse_tracking_request"
-	WHERE
-		date_jst = date('{{ ds}}')
-		AND date(date) >= date('{{ ds }}') - INTERVAL '1' DAY
-		AND date(date) <= date('{{ ds }}')
-    AND ua_category IN ({{ ua_category }})
-		AND is_ignore_ip = False
+  WHERE
+    date_jst = date('{{ ds }}')
+    AND date(date) >= date('{{ ds }}') - INTERVAL '1' DAY
+    AND date(date) <= date('{{ ds }}')
+    AND ua_category IN ('pc', 'smartphone')
+    AND is_ignore_ip = False
 ),
 
 -----------
 -- jse_tracking_impression から必要カラムを抽出
 -----------
 jti_log AS (
-SELECT
-  uid,
-  search_request_id,
-  is_ad
-FROM
-  "dataplatform_datalake"."jse_tracking_impression" jti
-WHERE
-  date(jti.date) >= date('{{ ds }}') - interval '1' day
-  AND date(jti.date) <= date('{{ ds }}')
-
+    SELECT
+      uid,
+      search_request_id,
+      is_ad
+    FROM
+      "dataplatform_datalake"."jse_tracking_impression" jti
+    WHERE
+      date(jti.date) >= date('{{ ds }}') - interval '1' day
+      AND date(jti.date) <= date('{{ ds }}')
 ),
-
 
 base_tlb AS (
     SELECT 
@@ -90,7 +90,9 @@ base_tlb AS (
         base_sa sa ON sa.search_request_id = jtr.search_request_id
 ),
 
+---------------------
 -- 検索数
+---------------------
 search_count_table AS (
     SELECT 
         date_jst,
@@ -103,8 +105,9 @@ search_count_table AS (
     GROUP BY 
         date_jst
 ),
-
+---------------------
 -- ユニーククエリ数_実数値合計用
+---------------------
 unique_query_table AS (
     SELECT 
         date_jst,
@@ -127,8 +130,9 @@ unique_query_table AS (
     GROUP BY
         date_jst
 ),
-
+---------------------
 -- ユニーククエリ数_実数値UB用
+---------------------
 unique_query_for_ub_table AS (
     SELECT 
         date_jst,
@@ -153,8 +157,9 @@ unique_query_for_ub_table AS (
     GROUP BY
         date_jst
 ),
-
+---------------------
 -- ユニークブラウザ数
+---------------------
 ub_table AS(
     SELECT 
         date_jst,
@@ -167,14 +172,15 @@ ub_table AS(
     GROUP BY 
         date_jst
 ),
-
+---------------------
 -- Jobクリック数, オーガニッククリック数、ADクリック数
+---------------------
 job_ct_table AS (
     SELECT
         date_jst,
         COUNT(*) as job_click_count,
       	COUNT(CASE WHEN element in ('求人', '求人_応募画面') THEN 1 END) as organic_click_count,
-  	    COUNT(CASE WHEN element in ('広告', '広告_応募画面') THEN 1 END) as ad_click_count
+  	COUNT(CASE WHEN element in ('広告', '広告_応募画面') THEN 1 END) as ad_click_count
     FROM 
         base_tlb bt
     WHERE
@@ -227,7 +233,7 @@ imps_table AS (
     FROM 
         base_tlb bt
     INNER JOIN
-        jti_log 
+        jti_log jti
         ON bt.search_request_id = jti.search_request_id
     WHERE
         bt.event_type = 'transition'
@@ -425,8 +431,7 @@ sa_search_request AS (
 	GROUP BY
 		uid,
 		visit_id,
-		search_request_id,
-		bucket_type
+		search_request_id
 ),
 -- 検索一覧でJobクリック行動したログとその時間を取得
 sa_serp_click_event_organic AS (
@@ -763,9 +768,8 @@ direct_retry_tbl AS (
     SELECT
         date_jst,
         count(distinct(CASE WHEN is_direct_retry >= 1 THEN visit_id
-                             ELSE NULL
-                      END)
-          ) AS direct_retry_ss,
+                             ELSE NULL END)
+             ) AS direct_retry_ss,
         count(distinct visit_id) AS total_ss
     FROM
         get_re_search
@@ -799,9 +803,10 @@ calc_tbl AS (
         organic_entryclick_cnt,
         ad_entryclick_cnt,
         abandon_ss_count,
+        abandonrate,
         related_query_upper_click,
         abandon_ss_count *1.00 /session_count AS abandon_rate,
-        direct_retry_ss *1.00/ session_count AS direct_retry_rate
+        direct_retry_ss *1.00/ session_count AS direct_retry_rate,
        
         ---- 以下、per_UB で集計----
         search_count *1.00 /ub AS search_count_per_ub,
@@ -826,12 +831,14 @@ calc_tbl AS (
         abandon_ss_count *1.00 /ub AS abandon_ss_count_per_ub,
         related_query_upper_click *1.00 /ub AS related_query_upper_click_per_ub,
         zeromatch_count *1.00 /search_count AS zeromatch_rate
-
     FROM 
         search_count_table sct
     LEFT OUTER JOIN
         unique_query_table uqt 
             ON sct.date_jst = uqt.date_jst 
+    LEFT OUTER JOIN
+	unique_query_for_ub_table uqforub
+	    ON sct.date_jst = uqforub.date_jst 
     LEFT OUTER JOIN
         ub_table ut 
             ON sct.date_jst = ut.date_jst
