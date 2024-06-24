@@ -1,0 +1,883 @@
+-- 使用するStanby＿Analyticsログのカラム抽出
+
+WITH base_sa AS (
+    SELECT
+        date_jst,
+        uid,
+        visit_id,
+        page,
+        area,
+        event_type,
+        element,
+        search_request_id,
+        document_id,
+        current_url,
+        datetime_jst -- jobclick系が同じ日,同じカセットを連続してクリックした場合、それぞれ1カウントされます。
+    FROM
+        dataplatform_datalake.stanby_analytics sa
+    WHERE
+        is_ignore_ip = false
+        AND user_agent NOT IN ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/76.0.3809.100 Safari/537.36',
+                               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.91 Safari/537.36') 
+        AND date(sa.date) >= date('{{ ds }}') - interval '1' day
+        AND date(sa.date) <= date('{{ ds }}')
+        AND sa.date_jst = date('{{ ds }}')
+),
+
+-----------
+-- jse_tracking_request から必要カラムを抽出
+-----------
+jtr_log AS (
+  SELECT
+    date_jst,
+    uid,
+    visit_id,
+    search_request_id,
+    mergd_keyword,
+    merged_location,
+    create_datetime_jst,
+    search_page,
+    total_hits
+  FROM
+    "dataplatform_datalake"."jse_tracking_request"
+	WHERE
+		date_jst = date('{{ ds}}')
+		AND date(date) >= date('{{ ds }}') - INTERVAL '1' DAY
+		AND date(date) <= date('{{ ds }}')
+    AND ua_category IN ({{ ua_category }})
+		AND is_ignore_ip = False
+),
+
+-----------
+-- jse_tracking_impression から必要カラムを抽出
+-----------
+jti_log AS (
+SELECT
+  uid,
+  search_request_id,
+  is_ad
+FROM
+  "dataplatform_datalake"."jse_tracking_impression" jti
+WHERE
+  date(jti.date) >= date('{{ ds }}') - interval '1' day
+  AND date(jti.date) <= date('{{ ds }}')
+
+),
+
+
+base_tlb AS (
+    SELECT 
+        sa.uid,
+        sa.visit_id,
+        sa.search_request_id,
+        sa.date_jst,
+        sa.datetime_jst,
+        sa.page,
+        sa.area,
+        sa.event_type,
+        sa.element,
+        sa.current_url,
+        sa.document_id,
+        jtr.merged_keyword,
+        jtr.merged_location,
+        jtr.query_keyword,
+        jtr.query_location,
+        jtr.search_page,
+        total_hits
+    FROM 
+        jtr_log jtr
+    LEFT JOIN
+        base_sa sa ON sa.search_request_id = jtr.search_request_id
+),
+
+-- 検索数
+search_count_table AS (
+    SELECT 
+        date_jst,
+        count(distinct search_request_id) as search_count
+    FROM
+        base_tlb
+    WHERE
+        event_type = 'transition'
+        AND page = 'search'
+    GROUP BY 
+        date_jst
+),
+
+-- ユニーククエリ数_実数値合計用
+unique_query_table AS (
+    SELECT 
+        date_jst,
+        count(*) as variation
+    FROM (
+        SELECT
+            date_jst,
+            query_keyword,
+            query_location
+        FROM
+            base_tlb
+        WHERE
+            event_type = 'transition'
+            AND page = 'search'
+        GROUP BY
+            date_jst,
+            query_keyword,
+            query_location
+        )
+    GROUP BY
+        date_jst
+),
+
+-- ユニーククエリ数_実数値UB用
+unique_query_for_ub_table AS (
+    SELECT 
+        date_jst,
+        count(1) as variation_for_ub
+    FROM (
+        SELECT
+            uid,
+            date_jst,
+            query_keyword,
+            query_location
+        FROM
+            base_tlb
+        WHERE
+            event_type = 'transition'
+            AND page = 'search'
+        GROUP BY
+            uid,
+            date_jst,
+            query_keyword,
+            query_location
+        )
+    GROUP BY
+        date_jst
+),
+
+-- ユニークブラウザ数
+ub_table AS(
+    SELECT 
+        date_jst,
+        count(distinct uid) as ub
+    FROM
+        base_tlb
+    WHERE
+        event_type = 'transition'
+        AND page = 'search'
+    GROUP BY 
+        date_jst
+),
+
+-- Jobクリック数, オーガニッククリック数、ADクリック数
+job_ct_table AS (
+    SELECT
+        date_jst,
+        COUNT(*) as job_click_count,
+      	COUNT(CASE WHEN element in ('求人', '求人_応募画面') THEN 1 END) as organic_click_count,
+  	    COUNT(CASE WHEN element in ('広告', '広告_応募画面') THEN 1 END) as ad_click_count
+    FROM 
+        base_tlb bt
+    WHERE
+        bt.event_type = 'link'
+      	AND bt.page = 'search'
+      	AND bt.area = 'card'
+        AND bt.element in ('求人', '広告', '求人_応募画面', '広告_応募画面')
+    GROUP BY
+        date_jst
+),
+
+-- 求人カセット以外モジュールのクリック
+module_ct_table AS (
+    SELECT
+        date_jst,
+        COUNT(CASE WHEN event_type='link' THEN 1 ELSE NULL END) AS other_link_count,
+        COUNT(CASE WHEN event_type='action' THEN 1 ELSE NULL END) AS other_action_count
+    FROM 
+        base_tlb bt
+    WHERE
+        event_type IN ('link', 'action') -- ページ遷移が生じるクリックを指定
+        AND page = 'search' -- 一覧ページを指定
+        AND area <> 'card'
+    GROUP BY
+        date_jst
+),
+
+-- PV数
+pv_table AS (
+    SELECT
+        date_jst,
+        COUNT(*) as pv,
+        COUNT(CASE WHEN search_page = 1 THEN 1 END) as pv_1st
+    FROM 
+        base_tlb bt
+    WHERE
+        bt.event_type = 'transition'
+        AND bt.page = 'search'
+    GROUP BY
+        date_jst
+),
+
+-- impression数
+imps_table AS (
+    SELECT
+        bt.date_jst,
+        count(*) AS imps,
+        COUNT(CASE WHEN is_ad = false THEN 1 END) as organic_impression_count,
+        COUNT(CASE WHEN is_ad = true THEN 1 END) as ad_impression_count
+    FROM 
+        base_tlb bt
+    INNER JOIN
+        jti_log 
+        ON bt.search_request_id = jti.search_request_id
+    WHERE
+        bt.event_type = 'transition'
+        AND bt.page = 'search'
+    GROUP BY
+        bt.date_jst
+),
+
+-- ゼロマッチ検索数
+zeromatch_count_table AS (
+    SELECT 
+        date_jst,
+        count(distinct search_request_id) as zeromatch_count
+    FROM
+        base_tlb
+    WHERE
+        event_type = 'transition'
+        AND page = 'search'
+        AND total_hits = 0
+    GROUP BY
+        date_jst
+),
+
+-- Session数
+session_count_table AS (
+    SELECT 
+        date_jst,
+        count(distinct visit_id) as session_count   
+    FROM
+        base_tlb
+    WHERE
+        event_type = 'transition'
+        AND page = 'search'
+    GROUP BY 
+        date_jst
+),
+
+-- 上部関連リンクのクリック数
+related_query_upper_table AS (
+    SELECT 
+        date_jst,
+        count(1) AS related_query_upper_click   
+    FROM
+        base_tlb
+    WHERE
+        area = 'related_query_upper'
+        AND event_type = 'link' 
+        AND page = 'search' 
+    GROUP BY 
+        date_jst
+),
+
+---- ポジション別のカセットクリック
+row_data_table AS ( 
+    SELECT 
+        date_jst,
+        uid,
+        jtric.search_request_id,
+        impression_document_id,
+        impression_order,
+        clicked,
+        search_page,
+        impression_is_ad
+    FROM (
+        SELECT 
+            date_jst,
+            search_request_id,
+            impression_document_id,
+            impression_order,
+            clicked,
+            search_page,
+            impression_is_ad
+        FROM 
+            "dataplatform_intermediate"."jse_tracking_request_impression_click_log" jtric
+        WHERE
+            jtric.is_ignore_ip = False
+            AND jtric.date_jst = date('{{ ds }}')
+            AND date(jtric.date) >= date('{{ ds }}') - interval '1' day
+            AND date(jtric.date) <= date('{{ ds }}')
+            AND jtric.ua_category IN ('pc', 'smartphone')
+            AND jtric.ua_value NOT LIKE 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/76.0.3809.100 Safari/537.36'
+            -- AND search_page = 1
+    ) jtric
+    INNER JOIN (
+        SELECT DISTINCT
+            uid,
+            search_request_id
+        FROM 
+            base_tlb
+        WHERE 
+            page = 'search'
+            AND event_type = 'transition'
+    )sa ON sa.search_request_id = jtric.search_request_id
+),
+
+position_organic AS(
+    SELECT
+        uid,
+        impression_document_id,
+    	ROW_NUMBER() OVER( 
+    	    PARTITION BY search_request_id
+    	    ORDER BY impression_order ASC) AS organic_impression_order,
+        CASE WHEN clicked THEN 1 ELSE 0 END AS is_clicked, -- endの後の'is_clicked'は'as is_clicked'の略記
+        search_page,
+        date_jst
+    FROM
+        row_data_table
+    WHERE
+        impression_is_ad = False
+),
+
+position_ad AS(
+    SELECT
+        uid,
+        impression_document_id,
+    	ROW_NUMBER() OVER( 
+    	    PARTITION BY search_request_id
+    	    ORDER BY impression_order ASC) AS ad_impression_order,
+        CASE WHEN clicked THEN 1 ELSE 0 END AS is_clicked, 
+        search_page,
+        date_jst
+    FROM
+        row_data_table
+    WHERE
+        impression_is_ad = True
+),
+
+clicks_organic AS (
+    SELECT
+        date_jst,
+        count(CASE WHEN organic_impression_order = 1 THEN impression_document_id END) as imps_organic_1st,
+        sum(CASE WHEN organic_impression_order = 1 THEN is_clicked END) as clicks_organic_1st,
+        count(CASE WHEN organic_impression_order = 2 THEN impression_document_id END) as imps_organic_2nd,
+        sum(CASE WHEN organic_impression_order = 2 THEN is_clicked END) as clicks_organic_2nd
+    FROM
+        position_organic
+    GROUP BY
+        date_jst
+),
+
+clicks_ad AS (
+    SELECT
+        date_jst,
+        count(CASE WHEN ad_impression_order = 1 THEN impression_document_id END) as imps_ad_1st,
+        sum(CASE WHEN ad_impression_order = 1 THEN is_clicked END) as clicks_ad_1st,
+        count(CASE WHEN ad_impression_order = 2 THEN impression_document_id END) as imps_ad_2nd,
+        sum(CASE WHEN ad_impression_order = 2 THEN is_clicked END) as clicks_ad_2nd
+    FROM
+        position_ad
+    GROUP BY
+        date_jst
+),
+
+-- ポジション別クリック数の集計
+position_click_tbl AS (
+    SELECT
+        co.date_jst,
+        clicks_organic_1st,
+        clicks_organic_2nd,
+        clicks_ad_1st,
+        clicks_ad_2nd
+    FROM 
+        clicks_organic co
+    LEFT JOIN
+        clicks_ad ca 
+            ON co.date_jst = ca.date_jst
+),
+
+--------------
+-- OrganicEntryClickの集計
+--------------
+req_log_req AS (
+	SELECT
+		search_request_id,
+		min(from_iso8601_timestamp(create_datetime_jst)) AS serp_request_time_jst,
+		date_jst
+  FROM
+    jtr_log
+  GROUP BY
+		search_request_id,
+		date_jst
+),
+sa_search_request AS (
+	SELECT
+		uid,
+		visit_id,
+		search_request_id,
+		min(from_iso8601_timestamp(datetime_jst)) AS serp_request_time_jst,
+		min(date_jst) AS date_jst
+	FROM
+		base_sa
+	WHERE
+		event_type = 'transition'
+    AND page = 'search'
+	GROUP BY
+		uid,
+		visit_id,
+		search_request_id,
+		bucket_type
+),
+-- 検索一覧でJobクリック行動したログとその時間を取得
+sa_serp_click_event_organic AS (
+	SELECT
+		uid,
+		visit_id,
+		document_id,
+		search_request_id,
+		min(from_iso8601_timestamp(datetime_jst)) AS serp_click_time_jst
+	FROM
+		base_sa
+	WHERE
+		event_type = 'link'
+		AND PAGE = 'search'
+		AND area = 'card'
+        AND (
+			  element = '求人'
+			  OR element = '求人_応募画面'
+		  )
+	GROUP BY
+		uid,
+		visit_id,
+		search_request_id,
+		document_id
+),
+-- organic_entryclick_hashClickしたログのみを取得 (ページは一覧or詳細)
+sa_organic_entryclick_event AS (
+	SELECT
+		uid,
+		visit_id,
+		document_id,
+		max(
+			CASE
+				WHEN PAGE = 'search' THEN 1
+				ELSE 0
+			END
+		) AS is_serp_apply_ct,
+		min(from_iso8601_timestamp(datetime_jst)) AS detail_click_time_jst
+	FROM
+		base_sa
+	WHERE
+		event_type = 'link'
+		AND (
+    			(
+    				PAGE = 'job_detail'
+    				AND element IN ('応募ボタン',
+    				                '応募画面へ進む_applyurl',
+    				                '応募画面へ進む_stanbyapply')
+    			)
+    			OR (
+    				PAGE = 'search'
+    				AND element = '求人_応募画面'
+    			)
+		)
+	GROUP BY
+		uid,
+		visit_id,
+		document_id
+),
+
+bucketed_request_click_organic_entryclick_event AS (
+	SELECT
+		R.uid,
+		R.visit_id,
+		R.search_request_id,
+		R.serp_request_time_jst,
+		A.document_id,
+		CASE
+			WHEN A.document_id IS NOT NULL THEN 1
+			ELSE 0
+		END AS serp_click,
+		CASE
+			WHEN B.document_id IS NOT NULL THEN CONCAT(R.visit_id, '_', B.document_id)
+		END AS organic_entryclick_hash,
+		coalesce(is_serp_apply_ct, 0) AS is_serp_apply_ct,
+		R.date_jst AS date_jst
+	FROM
+		req_log_req AS JSE_REQ
+		INNER JOIN sa_search_request AS R 
+      ON JSE_REQ.search_request_id = R.search_request_id
+  		AND abs(
+  			date_diff(
+  				'second',
+  				JSE_REQ.serp_request_time_jst,
+  				R.serp_request_time_jst
+  			)
+  		) <= 60
+		LEFT JOIN sa_serp_click_event_organic AS A 
+      ON R.uid = A.uid
+		  AND R.visit_id = A.visit_id
+		  AND date_diff(
+			  'second',
+			  R.serp_request_time_jst,
+			  A.serp_click_time_jst
+		  ) <= 1800
+		  AND R.search_request_id = A.search_request_id
+		  AND R.serp_request_time_jst < A.serp_click_time_jst
+		LEFT JOIN sa_organic_entryclick_event AS B 
+      ON A.uid = B.uid
+  		AND A.visit_id = B.visit_id
+  		AND A.document_id = B.document_id
+  		AND date_diff(
+  			'second',
+  			A.serp_click_time_jst,
+  			B.detail_click_time_jst
+  		) <= 1800
+),
+stat_organic_entryclick AS (
+	SELECT
+		date_jst,
+		COUNT(DISTINCT organic_entryclick_hash) AS organic_entryclick_cnt
+	FROM
+    bucketed_request_click_organic_entryclick_event
+	GROUP BY
+		date_jst
+),
+
+
+--------------
+-- ADEntryClickの集計
+--------------
+-- 検索一覧でJobクリック行動したログとその時間を取得
+sa_serp_click_event_ad AS (
+	SELECT
+		uid,
+		visit_id,
+		document_id,
+		search_request_id,
+		min(from_iso8601_timestamp(datetime_jst)) AS serp_click_time_jst
+	FROM
+		base_sa
+	WHERE
+		event_type = 'link'
+		AND PAGE = 'search'
+		AND area = 'card'
+        AND (
+			  element = '広告'
+			  OR element = '広告_応募画面'
+		  )
+	GROUP BY
+		uid,
+		visit_id,
+		search_request_id,
+		document_id
+),
+-- ad_entryclick_hashClickしたログのみを取得 (ページは一覧or詳細)
+sa_ad_entryclick_event AS (
+	SELECT
+		uid,
+		visit_id,
+		document_id,
+		max(
+			CASE
+				WHEN PAGE = 'search' THEN 1
+				ELSE 0
+			END
+		) AS is_serp_apply_ct,
+		min(from_iso8601_timestamp(datetime_jst)) AS detail_click_time_jst
+	FROM
+		base_sa
+	WHERE
+		event_type = 'link'
+		AND (
+    			(
+    				PAGE = 'job_detail'
+    				AND element IN ('応募ボタン',
+    				                '応募画面へ進む_applyurl',
+    				                '応募画面へ進む_stanbyapply')
+    			)
+    			OR (
+    				PAGE = 'search'
+    				AND element = '広告_応募画面'
+    			)
+		)
+	GROUP BY
+		uid,
+		visit_id,
+		document_id
+),
+
+bucketed_request_click_ad_entryclick_event AS (
+	SELECT
+		R.uid,
+		R.visit_id,
+		R.search_request_id,
+		R.serp_request_time_jst,
+		A.document_id,
+		CASE
+			WHEN A.document_id IS NOT NULL THEN 1
+			ELSE 0
+		END AS serp_click,
+		CASE
+			WHEN B.document_id IS NOT NULL THEN CONCAT(R.visit_id, '_', B.document_id)
+		END AS ad_entryclick_hash,
+		coalesce(is_serp_apply_ct, 0) AS is_serp_apply_ct,
+		R.date_jst AS date_jst
+	FROM
+		req_log_req AS JSE_REQ
+		INNER JOIN sa_search_request AS R 
+      ON JSE_REQ.search_request_id = R.search_request_id
+  		AND abs(
+  			date_diff(
+  				'second',
+  				JSE_REQ.serp_request_time_jst,
+  				R.serp_request_time_jst
+  			)
+  		) <= 60
+		LEFT JOIN sa_serp_click_event_ad AS A 
+      ON R.uid = A.uid
+		  AND R.visit_id = A.visit_id
+		  AND date_diff(
+			  'second',
+			  R.serp_request_time_jst,
+			  A.serp_click_time_jst
+		  ) <= 1800
+		  AND R.search_request_id = A.search_request_id
+		  AND R.serp_request_time_jst < A.serp_click_time_jst
+		LEFT JOIN sa_ad_entryclick_event AS B 
+      ON A.uid = B.uid
+  		AND A.visit_id = B.visit_id
+  		AND A.document_id = B.document_id
+  		AND date_diff(
+  			'second',
+  			A.serp_click_time_jst,
+  			B.detail_click_time_jst
+  		) <= 1800
+),
+stat_ad_entryclick AS (
+	SELECT
+		date_jst,
+		COUNT(DISTINCT ad_entryclick_hash) AS ad_entryclick_cnt
+	FROM
+    bucketed_request_click_ad_entryclick_event
+	GROUP BY
+		date_jst
+),
+
+
+
+---------------------
+-- AbandonRate
+---------------------
+-- sessionデータを取得
+ss_dataset AS (
+    SELECT 
+        date_jst,
+        visit_id,
+        sum(CASE
+                WHEN event_type = 'transition' THEN 1
+                ELSE 0
+            END) AS transition,
+        sum(CASE
+                WHEN event_type IN ('link','action') THEN 1
+                ELSE 0
+            END) AS click
+    FROM 
+        base_tlb
+    WHERE 
+        page = 'search' -- 追加
+        AND event_type IN ('transition', 'link', 'action') -- 追加
+        -- AND search_page = 1
+    GROUP BY 
+        date_jst,
+        visit_id
+),
+    
+-- abandonしたセッションの集計
+abandon_rate_tbl AS (
+    SELECT 
+        date_jst,
+        count(distinct CASE WHEN transition >= 1 AND click = 0
+                    THEN visit_id
+                END) AS abandon_ss_count,
+        CAST(count(distinct CASE WHEN transition >= 1 AND click = 0
+                    THEN visit_id
+                END)  as REAL ) 
+                / count(distinct CASE WHEN transition >= 1 
+                    THEN visit_id
+                END) AS abandonrate
+    FROM 
+        ss_dataset
+    GROUP BY 
+        date_jst
+),
+
+---- DirectRetryRateの集計
+join_sa_log AS (
+    SELECT
+        date_jst,
+        search_request_id,
+        uid,
+        visit_id,
+        datetime_jst,
+        event_type,
+        area,
+        element,
+        rank() over(partition by uid, visit_id order by datetime_jst ASC, event_type DESC) AS datetime_order,
+        lead(event_type) over(partition by uid, visit_id order by datetime_jst ASC, event_type DESC) AS lead_event_type,
+        lead(area) over(partition by uid, visit_id order by datetime_jst ASC, event_type DESC) AS lead_area,
+        lead(element) over(partition by uid, visit_id order by datetime_jst ASC, event_type DESC) AS lead_element,
+        lead(search_request_id) over(partition by uid, visit_id order by datetime_jst ASC) AS lag_search_request_id
+    FROM
+        base_tlb
+    WHERE 
+        page = 'search'
+        AND event_type NOT IN ('viewable', 'rendered')
+),
+
+-- 単純な再検索のみを取得する。ハーフモーダルの利用やページネーションはカウントせず、キーワードの変更などのみ。
+get_re_search AS (
+    SELECT
+        uid,
+        visit_id,
+        date_jst,
+        IF(
+            -- 単純な検索(「検索」ボタンをクリック、エンターキー押しても同様のログが飛ぶ)
+            (lead_area = 'search_block' AND lead_event_type = 'link' AND lead_element = '検索' AND event_type = 'transition')
+            OR
+            (lead_area = 'half_modal_keyword' AND lead_event_type = 'link' AND event_type = 'transition') -- ハーフモーダル開いてキーワード変更 (2023/02/16 full_modal に変更)
+            OR
+            (lead_area = 'half_modal_location' AND lead_event_type = 'link' AND event_type = 'transition') -- ハーフモーダル開いてロケーション変更 (2023/02/16 full_modal に変更)
+            OR
+            (lead_area = 'full_modal_keyword' AND lead_event_type = 'link' AND event_type = 'transition') -- フルモーダル開いてキーワード変更
+            OR
+            (lead_area = 'full_modal_location' AND lead_event_type = 'link' AND event_type = 'transition') -- フルモーダル開いてロケーション変更
+          , 1, 0) AS is_direct_retry
+    FROM
+        join_sa_log
+    WHERE
+        datetime_order = 1
+),
+
+direct_retry_tbl AS (
+    SELECT
+        date_jst,
+        count(distinct(CASE WHEN is_direct_retry >= 1 THEN visit_id
+                             ELSE NULL
+                      END)
+          ) AS direct_retry_ss,
+        count(distinct visit_id) AS total_ss
+    FROM
+        get_re_search
+    GROUP BY 
+        date_jst
+),
+
+-- 集計用テーブル
+calc_tbl AS (
+    SELECT 
+        sct.date_jst,
+        search_count,
+        variation,
+        variation_for_ub,
+        ub,
+        job_click_count,
+        organic_click_count,
+        ad_click_count,
+        other_link_count,
+        other_action_count,
+        pv,
+        pv_1st,
+        organic_impression_count,
+        ad_impression_count,
+        zeromatch_count,
+        session_count,
+        clicks_organic_1st,
+        clicks_organic_2nd,
+        clicks_ad_1st,
+        clicks_ad_2nd,
+        organic_entryclick_cnt,
+        ad_entryclick_cnt,
+        abandon_ss_count,
+        related_query_upper_click,
+        abandon_ss_count *1.00 /session_count AS abandon_rate,
+        direct_retry_ss *1.00/ session_count AS direct_retry_rate
+       
+        ---- 以下、per_UB で集計----
+        search_count *1.00 /ub AS search_count_per_ub,
+        variation_for_ub *1.00 /ub AS variation_per_ub,
+        job_click_count *1.00 /ub AS job_click_count_per_ub,
+        organic_click_count *1.00 /ub AS organic_click_count_per_ub,
+        ad_click_count *1.00 /ub AS ad_click_count_per_ub,
+        other_link_count *1.00 /ub AS other_link_count_per_ub,
+        other_action_count *1.00 /ub AS other_action_count_per_ub,
+        pv *1.00 /ub AS pv_per_ub,
+        pv_1st *1.00 /ub AS pv_1st_per_ub,
+        organic_impression_count *1.00 /ub AS organic_impression_count_per_ub,
+        ad_impression_count *1.00 /ub AS ad_impression_count_per_ub,
+        zeromatch_count *1.00 /ub AS zeromatch_count_per_ub,
+        session_count *1.00 /ub AS session_count_per_ub,
+        clicks_organic_1st *1.00 /ub AS clicks_organic_1st_per_ub,
+        clicks_organic_2nd *1.00 /ub AS clicks_organic_2nd_per_ub,
+        clicks_ad_1st *1.00 /ub AS clicks_ad_1st_per_ub,
+        clicks_ad_2nd *1.00 /ub AS clicks_ad_2nd_per_ub,
+        organic_entryclick_cnt *1.00 /ub AS organic_entryclick_per_ub,
+        ad_entryclick_cnt *1.00 /ub AS ad_entryclick_per_ub,
+        abandon_ss_count *1.00 /ub AS abandon_ss_count_per_ub,
+        related_query_upper_click *1.00 /ub AS related_query_upper_click_per_ub,
+        zeromatch_count *1.00 /search_count AS zeromatch_rate
+
+    FROM 
+        search_count_table sct
+    LEFT OUTER JOIN
+        unique_query_table uqt 
+            ON sct.date_jst = uqt.date_jst 
+    LEFT OUTER JOIN
+        ub_table ut 
+            ON sct.date_jst = ut.date_jst
+    LEFT OUTER JOIN
+        job_ct_table jct 
+            ON sct.date_jst = jct.date_jst
+    LEFT OUTER JOIN
+        module_ct_table mct 
+            ON sct.date_jst = mct.date_jst
+    LEFT OUTER JOIN
+        pv_table pt 
+            ON sct.date_jst = pt.date_jst 
+    LEFT OUTER JOIN
+        imps_table it 
+            ON sct.date_jst = it.date_jst 
+    LEFT OUTER JOIN
+        zeromatch_count_table zct 
+            ON sct.date_jst = zct.date_jst 
+    LEFT OUTER JOIN
+        related_query_upper_table rqut 
+            ON sct.date_jst = rqut.date_jst
+    LEFT OUTER JOIN
+        session_count_table ssct 
+            ON sct.date_jst = ssct.date_jst 
+    LEFT OUTER JOIN
+        position_click_tbl pct 
+            ON sct.date_jst = pct.date_jst
+    LEFT OUTER JOIN 
+        stat_organic_entryclick orgentry
+            ON sct.date_jst = orgentry.date_jst
+    LEFT OUTER JOIN 
+        stat_ad_entryclick adentry
+            ON sct.date_jst = adentry.date_jst
+    LEFT OUTER JOIN
+        abandon_rate_tbl art 
+            ON sct.date_jst = art.date_jst
+    LEFT OUTER JOIN
+        direct_retry_tbl drt 
+            ON sct.date_jst = drt.date_jst
+)
+
+
+
+SELECT *
+FROM calc_tbl
+ORDER BY date_jst
+LIMIT 100
+
+;
